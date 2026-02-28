@@ -1,25 +1,33 @@
 CompileFlags:
-  Add: [
-    "-std=c2x",        # C23 standard
-    "-Wall",
-    "-Wextra"
-  ]
-
+  Add: [-Wall, -Wextra]
+---
+# This section fixes the "Objective-C++" misidentification
+If:
+  PathMatch: .*\.h
+CompileFlags:
+  Add: [-x, c]
+---
+If:
+  PathMatch: [.*\.c, .*\.h]
+CompileFlags:
+  # Use c23 if on Clang 18+, otherwise c2x
+  Add: [-std=c23] 
+---
 Diagnostics:
-  ClangTidy:
-    Remove: [
-        "*",                                  # Disable all checks by default
-        "modernize-use-trailing-return-type", # C23 doesn't need this C++-ism
-        "readability-magic-numbers",          # Your frequencies are "magic" but necessary
-        "cppcoreguidelines-*",                # Ignore C++ specific guidelines
-        "llvmlibc-*",                         # Not a libc implementation
-        "hicpp-uppercase-literal-suffix",     # Coding preference - allow lowercase f/u
-        "readability-identifier-length",      # Allow short names (C4, W, H, etc.)
-        "altera-*",                           # Not targeting Altera/Intel FPGAs
-        "google-*",                           # Not following Google style guide
-        "boost-*",                            # Not using Boost
-        "fuchsia-*",                          # Not using Fuchsia
-        "zircon-*",                           # Not targeting Zircon
-        "openmp-*"                            # Not using OpenMP
-    ]
   UnusedIncludes: Strict
+  ClangTidy:
+    # In .clangd files, use 'Add' and 'Remove' lists
+    Remove: [
+        "modernize-use-trailing-return-type",
+        "readability-magic-numbers",
+        "cppcoreguidelines-*",
+        "llvmlibc-*",
+        "hicpp-uppercase-literal-suffix",
+        "readability-identifier-length",
+        "altera-*",
+        "google-*",
+        "boost-*",
+        "fuchsia-*",
+        "zircon-*",
+        "openmp-*"
+    ]
