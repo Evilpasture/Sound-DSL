@@ -1,0 +1,25 @@
+CompileFlags:
+  Add: [
+    "-std=c2x",        # C23 standard
+    "-Wall",
+    "-Wextra"
+  ]
+
+Diagnostics:
+  ClangTidy:
+    Remove: [
+        "*",                                  # Disable all checks by default
+        "modernize-use-trailing-return-type", # C23 doesn't need this C++-ism
+        "readability-magic-numbers",          # Your frequencies are "magic" but necessary
+        "cppcoreguidelines-*",                # Ignore C++ specific guidelines
+        "llvmlibc-*",                         # Not a libc implementation
+        "hicpp-uppercase-literal-suffix",     # Coding preference - allow lowercase f/u
+        "readability-identifier-length",      # Allow short names (C4, W, H, etc.)
+        "altera-*",                           # Not targeting Altera/Intel FPGAs
+        "google-*",                           # Not following Google style guide
+        "boost-*",                            # Not using Boost
+        "fuchsia-*",                          # Not using Fuchsia
+        "zircon-*",                           # Not targeting Zircon
+        "openmp-*"                            # Not using OpenMP
+    ]
+  UnusedIncludes: Strict

@@ -1,0 +1,24 @@
+---
+Checks: >-
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  performance-*,
+  -performance-avoid-endl
+# -* disables everything first, keeping only critical checks minimal.
+# We enable bugprone and performance, then exclude specific noisy checks.
+
+WarningsAsErrors: ""
+HeaderFilterRegex: '.*'
+
+CheckOptions:
+  - key:             modernize-use-auto.MinTypeNameLength
+    value:           '3'
+  - key:             bugprone-suspicious-include.HeaderFileExtensions
+    value:           'h,hpp,hh'
+# This ensures that math constants and note names don't trigger "short identifier" warnings.
+  - key:             readability-identifier-length.MinimumVariableNameLength
+    value:           '1'
+  - key:             readability-identifier-length.MinimumConstantNameLength
+    value:           '1'
+---
