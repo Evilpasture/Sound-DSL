@@ -1,314 +1,303 @@
 #ifdef _WIN32
-#pragma warning(disable : 4996) // Disable 'fopen' deprecation warning on MSVC
+    #pragma warning(disable : 4996)
+    #include <windows.h>
+    #define THREAD_FUNC DWORD WINAPI
+    #define THREAD_RET DWORD
+    typedef HANDLE ThreadHandle;
+    // Get CPU core count on Windows
+    int get_core_count() {
+        SYSTEM_INFO sysinfo;
+        GetSystemInfo(&sysinfo);
+        return sysinfo.dwNumberOfProcessors;
+    }
+#else
+    #include <pthread.h>
+    #include <unistd.h>
+    #define THREAD_FUNC void*
+    #define THREAD_RET void*
+    typedef pthread_t ThreadHandle;
+    // Get CPU core count on Linux/Mac
+    int get_core_count() {
+        return (int)sysconf(_SC_NPROCESSORS_ONLN);
+    }
 #endif
 
 #include "synth_dsl.h"
 #include <math.h>
 #include <stdio.h>
-#include <stdlib.h> // For rand()
+#include <stdlib.h>
 
-// --- INTERNAL CONSTANTS ---
-constexpr int SAMPLE_RATE = 44100;
-constexpr double PI_VAL = 3.14159265358979323846;
-constexpr double MASTER_VOLUME = 0.3; // Safely scaled to accommodate 3 oscillators + chords
-constexpr uint32_t DELAY_MAX = 44100; // 1 second of delay buffer at 44.1kHz
+static constexpr int SAMPLE_RATE = 44100;
+static constexpr double PI_VAL = 3.14159265358979323846;
 
-// --- INTERNAL STATE STRUCTURES ---
-typedef struct {
-    float buffer[DELAY_MAX];
-    uint32_t pos;
-    float feedback;
-    float mix;
-    uint32_t length;
-} DelayLine;
+// ==========================================
+// SHARED DSP ENGINE
+// ==========================================
 
-typedef struct {
-    WaveType type;
-    float volume;
-    float detune; // In semitones
-} SynthOsc;
+static float sample_patch(const SynthPatch* p, float freq, float local_t, float total_dur) {
+    if (local_t < 0.0f) return 0.0f;
 
-typedef struct {
-    FILE *fp;
-    uint32_t samples;
-    bool error;
-    SynthOsc voices[3];
-    ADSR adsr;
-    float vibrato_depth; 
-    float vibrato_rate;  
-    DelayLine delay;
-    int bit_depth;
-} SoundContext;
-
-// Global internal context (zero-initialized automatically)
-static SoundContext ctx = {
-    .fp = nullptr, 
-    .samples = 0, 
-    .error = false,
-    .voices = {
-        {WAVE_SINE, 1.0f, 0.0f}, // Voice 0: On by default
-        {WAVE_SINE, 0.0f, 0.0f}, // Voice 1: Off
-        {WAVE_SINE, 0.0f, 0.0f}  // Voice 2: Off
-    },
-    .adsr = {0.01f, 0.00f, 1.0f, 0.05f}, // Basic Organ ADSR
-    .vibrato_depth = 0.0f, 
-    .vibrato_rate = 5.0f,
-    .bit_depth = 16 // Full quality
-};
-
-// --- WAV HEADER LOGIC ---
-[[nodiscard]]
-static bool write_wav_header(FILE *f, uint32_t sample_count) {
-    if (f == nullptr) return false;
-    if (fseek(f, 0, SEEK_SET) != 0) return false;
-
-    const uint32_t data_size = sample_count * (uint32_t)sizeof(int16_t);
-    const uint32_t file_size = 36u + data_size;
-    const uint32_t byte_rate = (uint32_t)SAMPLE_RATE * (uint32_t)sizeof(int16_t);
-
-    // Lambda-like macro for clean logical AND chaining
-    #define WRITE_RAW(ptr, sz) (fwrite((ptr), (sz), 1, f) == 1)
-
-    static constexpr uint32_t sub1_size = 16;
-    static constexpr uint16_t audio_format = 1;
-    static constexpr uint16_t num_channels = 1;
-    static constexpr uint32_t s_rate = (uint32_t)SAMPLE_RATE;
-    static constexpr uint16_t block_align = 2;
-    static constexpr uint16_t bits_per_sample = 16;
-
-    const bool ok = WRITE_RAW("RIFF", 4)
-                 && WRITE_RAW(&file_size, 4)
-                 && WRITE_RAW("WAVEfmt ", 8)
-                 && WRITE_RAW(&sub1_size, 4)
-                 && WRITE_RAW(&audio_format, 2)
-                 && WRITE_RAW(&num_channels, 2)
-                 && WRITE_RAW(&s_rate, 4)
-                 && WRITE_RAW(&byte_rate, 4)
-                 && WRITE_RAW(&block_align, 2)
-                 && WRITE_RAW(&bits_per_sample, 2)
-                 && WRITE_RAW("data", 4)
-                 && WRITE_RAW(&data_size, 4);
-
-    #undef WRITE_RAW
-    return ok;
-}
-
-// --- PUBLIC C CONFIGURATION API ---
-
-// Resets the synth to a single oscillator (Voice 0) and mutes the others.
-bool synth_set_wave(WaveType wave) {
-    // Voice 0: The selected wave, full volume, centered tuning
-    ctx.voices[0].type = wave;
-    ctx.voices[0].volume = 1.0f;
-    ctx.voices[0].detune = 0.0f;
-
-    // Voice 1 & 2: Muted
-    ctx.voices[1].volume = 0.0f;
-    ctx.voices[2].volume = 0.0f;
-    
-    return true;
-}
-
-bool synth_set_osc(int index, WaveType type, float volume, float detune) {
-    if (index < 0 || index > 2) return false;
-    ctx.voices[index].type = type;
-    ctx.voices[index].volume = volume;
-    ctx.voices[index].detune = detune;
-    return true;
-}
-
-bool synth_set_adsr(ADSR adsr) { 
-    ctx.adsr = adsr; 
-    return true; 
-}
-
-bool synth_set_vibrato(float depth, float rate) { 
-    ctx.vibrato_depth = depth; 
-    ctx.vibrato_rate = rate; 
-    return true; 
-}
-
-bool synth_set_bit_depth(int bits) { 
-    ctx.bit_depth = bits; 
-    return true; 
-}
-
-bool synth_set_delay(float time, float feedback, float mix) {
-    float safe_time = (time > 1.0f) ? 1.0f : ((time < 0.0f) ? 0.0f : time);
-    ctx.delay.length = (uint32_t)(safe_time * (float)SAMPLE_RATE);
-    ctx.delay.feedback = feedback;
-    ctx.delay.mix = mix;
-    return true;
-}
-
-// --- PUBLIC C LIFECYCLE API ---
-
-bool synth_start_track(const char *filename) {
-    ctx = (SoundContext){
-        .fp = fopen(filename, "wb"), 
-        .samples = 0, 
-        .error = false, 
-        .voices = {{WAVE_SINE, 1.0f, 0.0f}, {WAVE_SINE, 0.0f, 0.0f}, {WAVE_SINE, 0.0f, 0.0f}},
-        .adsr = {0.01f, 0.00f, 1.0f, 0.05f}, 
-        .bit_depth = 16
-    };
-    if (ctx.fp == nullptr) return false;
-    return write_wav_header(ctx.fp, 0);
-}
-
-bool synth_end_track(void) {
-    bool success = !ctx.error;
-    if (success && ctx.fp != nullptr) {
-        success = write_wav_header(ctx.fp, ctx.samples);
-    }
-    if (ctx.fp != nullptr) {
-        if (fclose(ctx.fp) != 0) {
-            success = false;
-        }
-    }
-    // Fully clear context to prevent accidental writes after close
-    ctx = (SoundContext){.fp = nullptr, .samples = 0, .error = false};
-    return success;
-}
-
-// --- THE RENDER ENGINE ---
-
-bool synth_render_chord(const float *freqs, size_t count, float dur) {
-    if (ctx.error || ctx.fp == nullptr || count == 0 || dur <= 0.0f) return false;
-
-    const auto total_samples = (uint32_t)((double)SAMPLE_RATE * (double)dur);
-    
-    // --- PRE-CALCULATIONS ---
-    
     // 1. ADSR
-    const double A = (double)ctx.adsr.attack_time;
-    const double D = (double)ctx.adsr.decay_time;
-    const double S = (double)ctx.adsr.sustain_lvl;
-    const double R = (double)ctx.adsr.release_time;
+    float amp = 0.0f;
+    float rel_start = total_dur; // Note off time
     
-    // Limit the release tail to a maximum of 50% of the note's duration.
-    // This ensures short notes aren't completely swallowed by their own release phase (preventing t_rel = 0).
-    const double max_r = (double)dur * 0.5;
-    const double act_r = (R < max_r) ? R : max_r;
-    const double t_rel = (double)dur - act_r;
-
-    double rel_lvl = S;
-    if (t_rel < A) {
-        rel_lvl = (A > 0.0) ? (t_rel / A) : 1.0;
-    } else if (t_rel < A + D) {
-        rel_lvl = (D > 0.0) ? (1.0 - (1.0 - S) * ((t_rel - A) / D)) : S;
+    // Release Phase
+    if (local_t > rel_start) {
+        float rel_prog = (local_t - rel_start) / p->adsr.release_time;
+        if (rel_prog >= 1.0f) return 0.0f;
+        amp = p->adsr.sustain_lvl * (1.0f - rel_prog);
+    } 
+    // Attack Phase
+    else if (local_t < p->adsr.attack_time) {
+        // Safe div check
+        amp = (p->adsr.attack_time > 0.0f) ? (local_t / p->adsr.attack_time) : 1.0f;
+    } 
+    // Decay Phase
+    else if (local_t < p->adsr.attack_time + p->adsr.decay_time) {
+        float decay_prog = (local_t - p->adsr.attack_time) / p->adsr.decay_time;
+        amp = 1.0f - (1.0f - p->adsr.sustain_lvl) * decay_prog;
+    } 
+    // Sustain Phase
+    else {
+        amp = p->adsr.sustain_lvl;
     }
 
-    // 2. Bitcrusher
-    const bool crushing = (ctx.bit_depth < 16 && ctx.bit_depth > 0);
-    const double crush_scale = crushing ? pow(2.0, (double)ctx.bit_depth - 1.0) : 1.0;
+    if (amp <= 0.001f) return 0.0f;
 
-    // 3. Oscillator Tuning Multipliers (Semitones to Frequency ratios)
-    double osc_mult[3];
-    for (int v = 0; v < 3; ++v) {
-        osc_mult[v] = pow(2.0, (double)ctx.voices[v].detune / 12.0);
+    // 2. LFO
+    double lfo_mod = 0.0;
+    if (p->vibrato_rate > 0.0f && p->vibrato_depth > 0.0f) {
+        double w = 2.0 * PI_VAL * p->vibrato_rate;
+        lfo_mod = (p->vibrato_depth * 0.01) * ((1.0 - cos(w * local_t)) / w);
     }
 
-    // --- THE MASTER DSP LOOP ---
-
-    #pragma unroll(4)
-    for (auto i = 0u; i < total_samples; i++) {
-        const double time_s = (double)i / (double)SAMPLE_RATE;
+    // 3. Multi-Oscillator Mix
+    double mix = 0.0;
+    for (int v = 0; v < 3; v++) {
+        if (p->oscs[v].volume <= 0.001f) continue;
         
-        // --- ADSR ENVELOPE ---
-        double env = 0.0;
-        if (time_s >= t_rel) { 
-            env = (act_r > 0.0) ? rel_lvl * (1.0 - ((time_s - t_rel) / act_r)) : 0.0;
-        } else if (time_s < A) { 
-            env = (A > 0.0) ? (time_s / A) : 1.0;
-        } else if (time_s < A + D) { 
-            env = (D > 0.0) ? (1.0 - (1.0 - S) * ((time_s - A) / D)) : S;
-        } else { 
-            env = S;
-        }
-        if (env < 0.0) env = 0.0;
-
-        // --- POLYPHONIC OSCILLATORS ---
-        double mixed_val = 0.0;
-        for (size_t n = 0; n < count; n++) {
-            const double f0 = (double)freqs[n];
-            if (f0 <= 0.0) continue; // Skip math for rests
-
-            // LFO / Vibrato (Calculated via Integral to preserve FM phase)
-            const double rate = (double)ctx.vibrato_rate;
-            const double depth = (double)ctx.vibrato_depth * 0.01;
-            double lfo_mod = 0.0;
-            if (rate > 0.0 && depth > 0.0) {
-                const double w = 2.0 * PI_VAL * rate;
-                lfo_mod = depth * ((1.0 - cos(w * time_s)) / w); 
+        double f_final = freq * pow(2.0, p->oscs[v].detune / 12.0);
+        double phase_cycles = f_final * local_t + f_final * lfo_mod;
+        
+        double sig = 0.0;
+        switch (p->oscs[v].type) {
+            case WAVE_SQUARE: {
+                double phase = fmod(phase_cycles, 1.0);
+                sig = (phase < 0.5) ? 1.0 : -1.0;
+                break;
             }
-
-            // Sum the 3 Voices
-            double voices_sum = 0.0;
-            for (int v = 0; v < 3; v++) {
-                if (ctx.voices[v].volume <= 0.001f) continue;
-
-                const double f_final = f0 * osc_mult[v]; 
-                const double phase_cycles = f_final * time_s + f_final * lfo_mod;
-                const double phase_rads = 2.0 * PI_VAL * phase_cycles;
-                
-                double sample_val = 0.0;
-                switch (ctx.voices[v].type) {
-                    case WAVE_SQUARE: 
-                        sample_val = (sin(phase_rads) >= 0.0) ? 1.0 : -1.0; 
-                        break;
-                    case WAVE_SAW:    
-                        sample_val = 2.0 * (fmod(phase_cycles, 1.0)) - 1.0; 
-                        break;
-                    case WAVE_NOISE:  
-                        sample_val = ((double)rand() / (double)RAND_MAX) * 2.0 - 1.0; 
-                        break;
-                    case WAVE_SINE:
-                    default:          
-                        sample_val = sin(phase_rads); 
-                        break;
-                }
-                voices_sum += sample_val * (double)ctx.voices[v].volume;
+            case WAVE_SAW: {
+                double phase = fmod(phase_cycles, 1.0);
+                sig = 2.0 * phase - 1.0;
+                break;
             }
-            mixed_val += voices_sum;
+            case WAVE_NOISE:
+                sig = ((double)rand() / (double)RAND_MAX) * 2.0 - 1.0;
+                break;
+            case WAVE_SINE:
+            default:
+                sig = sin(2.0 * PI_VAL * phase_cycles);
+                break;
         }
-
-        // Apply Envelope and Average by Chord size
-        const double dry = (mixed_val / (double)count) * env;
-        
-        // --- DELAY LINE (ECHO) ---
-        double delayed = 0.0;
-        if (ctx.delay.length > 0) {
-            const uint32_t read_pos = (ctx.delay.pos + DELAY_MAX - ctx.delay.length) % DELAY_MAX;
-            delayed = (double)ctx.delay.buffer[read_pos];
-            
-            // Feed back into the buffer
-            ctx.delay.buffer[ctx.delay.pos] = (float)(dry + delayed * (double)ctx.delay.feedback);
-            
-            // Advance circular buffer
-            ctx.delay.pos = (ctx.delay.pos + 1) % DELAY_MAX;
-        }
-
-        // --- MASTER MIX ---
-        double out_val = dry + (delayed * (double)ctx.delay.mix);
-        
-        // --- BITCRUSHER ---
-        if (crushing) {
-            out_val = round(out_val * crush_scale) / crush_scale;
-        }
-        
-        // --- HARD CLIPPER & INT16 CONVERSION ---
-        out_val *= 32767.0 * MASTER_VOLUME;
-        if (out_val > 32767.0) out_val = 32767.0;  
-        if (out_val < -32768.0) out_val = -32768.0;
-
-        const int16_t out_sample = (int16_t)out_val;
-        
-        if (fwrite(&out_sample, sizeof(int16_t), 1, ctx.fp) != 1) { 
-            ctx.error = true; 
-            return false; 
-        }
+        mix += sig * p->oscs[v].volume;
     }
-    ctx.samples += total_samples;
+    
+    // 4. Bitcrusher (Quantization)
+    if (p->bit_depth > 0 && p->bit_depth < 16) {
+        double steps = pow(2.0, p->bit_depth);
+        mix = floor(mix * steps) / steps;
+    }
+
+    return (float)(mix * amp);
+}
+
+// ==========================================
+// SEQUENCER DATA & THREADING
+// ==========================================
+
+typedef struct { int track; float freq; float start; float dur; } NoteEvent;
+
+// Global Sequencer State
+static NoteEvent* seq_events = NULL;
+static int seq_event_count = 0;
+static int seq_event_capacity = 0;
+static SynthPatch seq_tracks[32] = {0};
+
+// Render Buffer (The entire song in RAM)
+static float* master_buffer = NULL;
+static uint32_t total_frames = 0;
+
+// Thread Context
+typedef struct {
+    uint32_t start_frame;
+    uint32_t end_frame;
+    int thread_id;
+} RenderJob;
+
+// --- WORKER THREAD FUNCTION ---
+// Each thread takes a slice of time (start_frame to end_frame)
+// and calculates the audio for that slice.
+// Worker thread logic - optimized to O(Active Notes)
+THREAD_FUNC render_worker(void* arg) {
+    RenderJob* job = (RenderJob*)arg;
+    
+    // We need a local way to track which notes are active in this thread's time slice
+    // A simple bitmask or small array for polyphony (e.g., max 128 notes at once)
+    int active_indices[256]; 
+    int active_count = 0;
+    int next_note_to_trigger = 0;
+
+    // Fast-forward next_note_to_trigger to the start of this thread's time slice
+    float thread_start_time = (float)job->start_frame / (float)SAMPLE_RATE;
+    while (next_note_to_trigger < seq_event_count && 
+           seq_events[next_note_to_trigger].start < thread_start_time) {
+        // If the note is already playing (or releasing) when the thread starts, add it
+        float release = seq_tracks[seq_events[next_note_to_trigger].track].adsr.release_time;
+        if (seq_events[next_note_to_trigger].start + seq_events[next_note_to_trigger].dur + release > thread_start_time) {
+            if (active_count < 256) active_indices[active_count++] = next_note_to_trigger;
+        }
+        next_note_to_trigger++;
+    }
+
+    for (uint32_t i = job->start_frame; i < job->end_frame; i++) {
+        float t = (float)i / (float)SAMPLE_RATE;
+        float mix = 0.0f;
+
+        // 1. Check if we need to trigger new notes
+        while (next_note_to_trigger < seq_event_count && seq_events[next_note_to_trigger].start <= t) {
+            if (active_count < 256) {
+                active_indices[active_count++] = next_note_to_trigger;
+            }
+            next_note_to_trigger++;
+        }
+
+        // 2. Process active notes and remove dead ones
+        for (int a = 0; a < active_count; ) {
+            int note_idx = active_indices[a];
+            NoteEvent* ev = &seq_events[note_idx];
+            SynthPatch* p = &seq_tracks[ev->track];
+            float end_time = ev->start + ev->dur + p->adsr.release_time;
+
+            if (t < end_time) {
+                mix += sample_patch(p, ev->freq, t - ev->start, ev->dur);
+                a++; // Note is still alive
+            } else {
+                // Note is dead, swap with last and shrink (O(1) removal)
+                active_indices[a] = active_indices[--active_count];
+            }
+        }
+        
+        mix *= 0.15f; 
+        master_buffer[i] = mix;
+    }
+    return 0;
+}
+
+// ==========================================
+// PUBLIC API IMPLEMENTATION
+// ==========================================
+
+void synth_seq_set_patch(int track_id, SynthPatch patch) {
+    if (track_id >= 0 && track_id < 32) seq_tracks[track_id] = patch;
+}
+
+void synth_seq_add_note(int track_id, float freq, float start_time, float duration) {
+    if (seq_event_count >= seq_event_capacity) {
+        seq_event_capacity = (seq_event_capacity == 0) ? 4096 : seq_event_capacity * 2;
+        seq_events = realloc(seq_events, seq_event_capacity * sizeof(NoteEvent));
+    }
+    seq_events[seq_event_count++] = (NoteEvent){track_id, freq, start_time, duration};
+}
+
+// --- MAIN RENDER ENTRY POINT ---
+bool synth_seq_render(const char *filename) {
+    // 1. Calculate Song Duration
+    float max_t = 0;
+    for(int i=0; i<seq_event_count; i++) {
+        float end = seq_events[i].start + seq_events[i].dur + seq_tracks[seq_events[i].track].adsr.release_time;
+        if (end > max_t) max_t = end;
+    }
+    max_t += 1.0f; // Tail padding
+    
+    total_frames = (uint32_t)(SAMPLE_RATE * max_t);
+    printf(" Allocating %.2f MB for %.2fs of audio...\n", (total_frames * sizeof(float)) / (1024.0*1024.0), max_t);
+    
+    // 2. Allocate Master Buffer
+    master_buffer = (float*)calloc(total_frames, sizeof(float));
+    if (!master_buffer) return false;
+
+    // 3. Prepare Threads
+    int num_cores = get_core_count();
+    // Cap cores to avoid overhead on small songs
+    if (num_cores > 16) num_cores = 16; 
+    if (num_cores < 1) num_cores = 1;
+    
+    printf(" Launching %d render threads...\n", num_cores);
+
+    ThreadHandle* threads = malloc(sizeof(ThreadHandle) * num_cores);
+    RenderJob* jobs = malloc(sizeof(RenderJob) * num_cores);
+    
+    uint32_t samples_per_thread = total_frames / num_cores;
+
+    // 4. Dispatch Threads
+    for (int i = 0; i < num_cores; i++) {
+        jobs[i].thread_id = i;
+        jobs[i].start_frame = i * samples_per_thread;
+        jobs[i].end_frame = (i == num_cores - 1) ? total_frames : (i + 1) * samples_per_thread;
+
+        #ifdef _WIN32
+            threads[i] = CreateThread(NULL, 0, render_worker, &jobs[i], 0, NULL);
+        #else
+            pthread_create(&threads[i], NULL, render_worker, &jobs[i]);
+        #endif
+    }
+
+    // 5. Join Threads (Wait)
+    for (int i = 0; i < num_cores; i++) {
+        #ifdef _WIN32
+            WaitForSingleObject(threads[i], INFINITE);
+            CloseHandle(threads[i]);
+        #else
+            pthread_join(threads[i], NULL);
+        #endif
+    }
+    
+    free(threads);
+    free(jobs);
+    printf(" Render complete. Writing to disk...\n");
+
+    // 6. Write WAV File
+    FILE* fp = fopen(filename, "wb");
+    if (!fp) { free(master_buffer); return false; }
+
+    // Write Header
+    uint32_t data_size = total_frames * sizeof(int16_t);
+    uint32_t file_size = 36 + data_size;
+    uint32_t byte_rate = SAMPLE_RATE * 2;
+    fwrite("RIFF", 4, 1, fp); fwrite(&file_size, 4, 1, fp); fwrite("WAVEfmt ", 8, 1, fp);
+    uint32_t sub1 = 16; uint16_t fmt = 1, chan = 1; uint32_t sr = SAMPLE_RATE;
+    uint16_t ba = 2, bps = 16;
+    fwrite(&sub1, 4, 1, fp); fwrite(&fmt, 2, 1, fp); fwrite(&chan, 2, 1, fp);
+    fwrite(&sr, 4, 1, fp); fwrite(&byte_rate, 4, 1, fp); fwrite(&ba, 2, 1, fp);
+    fwrite(&bps, 2, 1, fp); fwrite("data", 4, 1, fp); fwrite(&data_size, 4, 1, fp);
+
+    // Convert float buffer to int16 buffer for bulk write speed
+    int16_t* disk_buffer = malloc(total_frames * sizeof(int16_t));
+    for (uint32_t i = 0; i < total_frames; i++) {
+        float s = master_buffer[i];
+        if (s > 1.0f) s = 1.0f;
+        if (s < -1.0f) s = -1.0f;
+        disk_buffer[i] = (int16_t)(s * 32767.0f);
+    }
+    
+    fwrite(disk_buffer, sizeof(int16_t), total_frames, fp);
+    fclose(fp);
+
+    free(disk_buffer);
+    free(master_buffer);
+    free(seq_events);
+    seq_events = NULL;
+    seq_event_count = 0;
+    
     return true;
 }

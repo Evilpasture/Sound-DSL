@@ -1,7 +1,7 @@
 CompileFlags:
-  Add: [-Wall, -Wextra]
+  Add: [-Wall, -Wextra, -Wpedantic]
 ---
-# This section fixes the "Objective-C++" misidentification
+# Treat headers as C files, not C++ or Objective-C
 If:
   PathMatch: .*\.h
 CompileFlags:
@@ -10,24 +10,18 @@ CompileFlags:
 If:
   PathMatch: [.*\.c, .*\.h]
 CompileFlags:
-  # Use c23 if on Clang 18+, otherwise c2x
+  # C23 support
   Add: [-std=c23] 
 ---
 Diagnostics:
   UnusedIncludes: Strict
   ClangTidy:
-    # In .clangd files, use 'Add' and 'Remove' lists
+    # We only remove things that are strictly C++ specific or non-functional
     Remove: [
         "modernize-use-trailing-return-type",
-        "readability-magic-numbers",
         "cppcoreguidelines-*",
         "llvmlibc-*",
-        "hicpp-uppercase-literal-suffix",
-        "readability-identifier-length",
-        "altera-*",
         "google-*",
-        "boost-*",
         "fuchsia-*",
-        "zircon-*",
-        "openmp-*"
+        "zircon-*"
     ]

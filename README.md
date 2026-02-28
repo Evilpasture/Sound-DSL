@@ -1,84 +1,89 @@
 # Synth-DSL (Sound-DSL)
 
-A lightweight, zero-dependency polyphonic synthesizer and musical Domain-Specific Language (DSL) written in pure C23. 
+A high-performance, multi-threaded polyphonic synthesizer and musical Domain-Specific Language (DSL) written in **pure C23**. 
 
-Synth-DSL allows you to compose music directly in C code using an intuitive macro-based syntax. The engine processes your composition and renders it directly to a high-quality `16-bit 44.1kHz WAV` file—no external audio libraries required!
+Synth-DSL allows you to bridge the gap between MIDI composition and low-level DSP. Whether you are compiling MIDI files into optimized binary assets or composing directly in C, the engine renders high-fidelity `16-bit 44.1kHz WAV` files using modern parallel processing.
 
-## Features
+## Key Features
 
-* **Zero Dependencies**: The core synthesis engine requires only the standard C library (`<stdio.h>`, `<math.h>`). It writes binary RIFF/WAVE headers from scratch.
-* **The Macro DSL**: Compose using beautiful, readable macros like `PLAY()`, `NOTE()`, `CHORD()`, and `REST()`.
-* **Polyphonic Synthesis**: 
-  * Play massive chords dynamically.
-  * 3 Stackable Oscillators per voice.
-  * Waveforms: `SINE`, `SQUARE`, `SAW`, `NOISE`.
-* **Audio Effects (FX)**:
-  * **ADSR Envelopes**: Control Attack, Decay, Sustain, and Release times.
-  * **Delay Line**: Built-in feedback delay/echo.
-  * **LFO Vibrato**: Modulate pitch for rich, thick sounds.
-  * **Bitcrusher**: Dynamically drop the bit-depth (e.g., to 6-bit) mid-song for chiptune/synthwave breakdowns.
-* **Scientific Python Analyzer**: Includes a Python tool to visualize the waveform, spectrogram, and harmonic FFT of your generated tracks.
+*   **C23 Powered**: Built using modern C23 features (`static constexpr`, `[[nodiscard]]`, `[[maybe_unused]]`).
+*   **Multi-Threaded Rendering**: Massive polyphony is handled by a worker-thread architecture. It automatically scales to your CPU core count (e.g., rendering thousands of notes across 12+ threads).
+*   **MIDI Orchestration**: A Python-based compiler transforms standard MIDI files into optimized C loaders and binary data blobs.
+*   **Zero Dependencies**: The core engine requires only a standard C compiler (Clang 18+ or GCC 13+) and a math library. No external audio APIs needed.
+*   **Stacked DSP Engine**: 
+    *   3 Stackable Oscillators per voice (`SINE`, `SQUARE`, `SAW`, `NOISE`).
+    *   **ADSR Envelopes**: Precise control over Attack, Decay, Sustain, and Release.
+    *   **Vibrato & LFO**: Pitch modulation for rich, organic textures.
+    *   **Bitcrusher**: Real-time quantization for Lo-Fi and Chiptune aesthetics.
 
+## Prerequisites
 
-## Installation
+*   **Compiler**: Clang 18+ or GCC 13+ (Required for C23 support).
+*   **Build System**: CMake 3.25+ and [Ninja](https://ninja-build.org/).
+*   **Python**: 3.10+ (Tested up to 3.14-alpha) with `mido`.
+*   **Package Manager**: [uv](https://github.com/astral-sh/uv) (Recommended for seamless Python orchestration).
 
-### 1. Build and Run the Synthesizer
-Compile the C code using your compiler (GCC, Clang, or MSVC).
+## Installation & Build
 
-**Linux / macOS:**
-```bash
-gcc -O3 fur_elise.c synth_dsl.c -lm -o synth
-./synth
+The project uses CMake to orchestrate the Python MIDI compilation and the C build process in one step.
+
+```powershell
+# 1. Configure with Ninja and Clang
+cmake -G Ninja -DCMAKE_C_COMPILER=clang -B build
+
+# 2. Compile the MIDI and Build the Engine
+cmake --build build
+
+# 3. Render the Audio (Orchestrated Execution)
+cmake --build build --target render
 ```
 
-**Windows (MSVC):**
-```cmd
-cl /O2 fur_elise.c synth_dsl.c
-synth.exe
-```
+*This generates `theme_song.wav` in the `build/` directory.*
 
-*This will output a file named `fur_elise.wav` in your directory.*
+## Orchestration Workflow
 
-### 2. Analyze the Audio (Optional)
-We provide a Python script to visualize the DSP data, check for clipping, and view the spectrogram.
+### 1. MIDI to C (The Compiler)
+The `midi_compiler.py` script parses MIDI ticks, calculates timings, and generates a C entry point. It automatically maps MIDI channels to instrument patches:
+*   **Channel 10**: Automatically assigned to `PATCH_SNARE` (Noise).
+*   **Melodic Channels**: Assigned to `PATCH_BRASS` (Multi-SAW).
 
-**Requirements:** `numpy`, `matplotlib`, `scipy`
-
-```bash
-# Using uv, pip, or your preferred python environment
-python analyze_wav.py fur_elise.wav
-```
-
-## Composition
-
-The DSL maps standard musical notation (A0 to E9) to exact frequencies. You can change synthesizer parameters instantly between notes.
+### 2. Direct C Composition
+You can also compose directly in C using the constants defined in `synth_scale.h`.
 
 ```c
 #include "synth_dsl.h"
+#include "synth_scale.h"
 
 int main() {
-    synth_start_track("my_song.wav");
+    // Set a track patch
+    synth_seq_set_patch(0, PATCH_BRASS);
 
-    // Define an instrument
-    const ADSR PIANO = {0.02f, 0.25f, 0.5f, 0.8f};
+    // Add notes: track, frequency (Hz), start (s), duration (s)
+    synth_seq_add_note(0, A4, 0.0f, Q); 
+    synth_seq_add_note(0, E5, 0.5f, Q);
     
-    // Configure the synth
-    PLAY(
-        SET_OSC(0, WAVE_SQUARE, 0.5f, 0.0f),
-        SET_OSC(1, WAVE_SINE, 0.8f, 0.05f), // Detuned for chorus
-        SET_ADSR(PIANO),
-        SET_DELAY(0.36f, 0.4f, 0.25f)       // 360ms echo
-    );
-
-    // Play a chord and a melody
-    PLAY(
-        CHORD(0.5f, C3, E3, G3), // C Major chord for 0.5 seconds
-        NOTE(C4, 0.25f),         // Quarter note
-        NOTE(E4, 0.25f),
-        REST(0.5f)               // Silence (delay tails will still ring!)
-    );
-
-    synth_end_track();
+    // Render across all available CPU cores
+    synth_seq_render("composition.wav");
     return 0;
 }
 ```
+
+## Scientific Analysis
+
+Includes a Python-based DSP analyzer to visualize the results of your synthesis.
+
+```bash
+# Check for clipping, harmonics, and view the spectrogram
+python analyze_wav.py build/theme_song.wav
+```
+
+## Compatibility Note
+This project utilizes **C23-isms** that are currently incompatible with MSVC (`cl.exe`). Please use **Clang** or **GCC**. On Windows, it is highly recommended to run via the **Ninja** generator to avoid default MSVC project behavior.
+
+
+
+### Project Structure
+*   `synth_dsl.c/h`: The multi-threaded synthesis engine.
+*   `synth_scale.h`: Frequency constants (C0-E9) and rhythmic durations.
+*   `midi_compiler.py`: Transmutes MIDI files into C/Binary assets.
+*   `CMakeLists.txt`: The master orchestrator.
